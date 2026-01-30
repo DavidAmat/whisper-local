@@ -1,0 +1,4 @@
+whisper-client/.venv
+whisper-server/.venv
+whisper-server/__pycache__
+whisper-client/__pycache__
