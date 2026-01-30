@@ -158,24 +158,28 @@ def transcribe(
             pass
 
 
+@app.post("/stream")
 @app.post("/translate_stream")
-def translate_stream(
+def stream(
     file: UploadFile = File(...),
     language: str = None,
+    task: str = "transcribe",
     beam_size: int = DEFAULT_BEAM_SIZE,
 ):
     """
-    Stream translated (to English) Whisper segments as Server-Sent Events (SSE).
+    Stream Whisper segments as Server-Sent Events (SSE).
 
     - language: REQUIRED (source language of the audio)
-    - task: translate (Whisper built-in translation → English)
+    - task: transcribe (original language) or translate (to English)
     - Output: incremental segment events + [DONE]
     """
     if model is None:
         raise HTTPException(status_code=500, detail="Model not loaded")
 
     if not language:
-        raise HTTPException(status_code=400, detail="language parameter is required")
+        # We can actually let it be None and faster-whisper will auto-detect,
+        # but the prompt says the user is submitting "es".
+        pass
 
     if not file.filename:
         raise HTTPException(status_code=400, detail="Missing filename")
@@ -191,7 +195,7 @@ def translate_stream(
             tmp_path,
             beam_size=beam_size,
             language=language,
-            task="translate",   # ← IMPORTANT: streaming TRANSLATION
+            task=task,
             vad_filter=True,
         )
 

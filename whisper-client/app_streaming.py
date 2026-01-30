@@ -57,22 +57,31 @@ st.markdown(
 # UI Header
 # -------------------------
 st.markdown('<div class="chat-wrap">', unsafe_allow_html=True)
-st.markdown('<div class="header">Whisper – Streaming Translation</div>', unsafe_allow_html=True)
+st.markdown('<div class="header">Whisper – Streaming Transcription & Translation</div>', unsafe_allow_html=True)
 st.markdown(
-    '<div class="sub">Live, segment-by-segment translation powered by your Ubuntu GPU server.</div>',
+    '<div class="sub">Live, segment-by-segment processing powered by your GPU server.</div>',
     unsafe_allow_html=True,
 )
 
 # -------------------------
 # Controls
 # -------------------------
-with st.expander("Server & translation settings", expanded=False):
+with st.expander("Server & processing settings", expanded=False):
     server_url = st.text_input("Server URL", value=DEFAULT_SERVER)
-    language = st.selectbox(
-        "Audio language (required)",
-        LANG_CHOICES,
-        index=1 if "es" in LANG_CHOICES else 0,
-    )
+    col1, col2 = st.columns(2)
+    with col1:
+        language = st.selectbox(
+            "Audio language (required)",
+            LANG_CHOICES,
+            index=1 if "es" in LANG_CHOICES else 0,
+        )
+    with col2:
+        task = st.selectbox(
+            "Task",
+            ["transcribe", "translate"],
+            index=0,
+            help="'transcribe' keeps the original language. 'translate' converts to English."
+        )
     show_timestamps = st.toggle("Show timestamps", value=True)
 
 uploaded = st.file_uploader(
@@ -81,7 +90,7 @@ uploaded = st.file_uploader(
 )
 
 start = st.button(
-    "▶ Start streaming translation",
+    "▶ Start streaming",
     type="primary",
     use_container_width=True,
     disabled=(uploaded is None),
@@ -115,9 +124,9 @@ if start and uploaded is not None:
             }
 
             with requests.post(
-                f"{server_url.rstrip('/')}/translate_stream",
+                f"{server_url.rstrip('/')}/stream",
                 files=files,
-                params={"language": language},
+                params={"language": language, "task": task},
                 stream=True,
                 timeout=600,
                 headers={"Accept": "text/event-stream"},
@@ -156,7 +165,7 @@ if start and uploaded is not None:
 
                 meta.markdown(
                     f'<div class="meta">File: {uploaded.name} · Source language: {language} · '
-                    f'Task: translate → English</div>',
+                    f'Task: {task}</div>',
                     unsafe_allow_html=True,
                 )
 
