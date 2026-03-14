@@ -1,0 +1,245 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+REMOTE_USER="david"
+REMOTE_HOST="192.168.0.112"
+REMOTE_PORT="8080"
+
+CHUNK_SECONDS="3"
+WHISPER_LANG="auto"
+TRANSLATE="false"
+
+GLOBAL_OFFSET_MS=0
+_TS_SRT_PATTERN='^([0-9]{2}:[0-9]{2}:[0-9]{2},[0-9]{3})[[:space:]]+-->[[:space:]]+([0-9]{2}:[0-9]{2}:[0-9]{2},[0-9]{3})$'
+
+usage() {
+  cat <<EOF
+Usage:
+  $0 FILE -f FORMAT [-l LANG] [-t]
+
+Arguments:
+  FILE        Path to the input audio file
+  -f FORMAT   Input file format hint (e.g. aac, mp3, m4a). Optional; ffmpeg
+              auto-detects from the file when omitted.
+
+Options:
+  -l LANG     Language for Whisper request. Examples: en, es, auto
+              Default: auto
+  -t          Translate to English
+  -h, --help  Show this help
+
+Examples:
+  $0 ~/Desktop/audio_important.aac -f aac
+  $0 ~/Desktop/meeting.mp3 -f mp3 -l es
+  $0 ~/Desktop/lecture.m4a -f m4a -l en -t
+EOF
+}
+
+INPUT_FILE=""
+INPUT_FORMAT=""
+
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    -f)
+      shift
+      if [[ $# -eq 0 ]]; then
+        echo "error: -f requires a value"
+        usage
+        exit 1
+      fi
+      INPUT_FORMAT="$1"
+      shift
+      ;;
+    -l)
+      shift
+      if [[ $# -eq 0 ]]; then
+        echo "error: -l requires a value"
+        usage
+        exit 1
+      fi
+      WHISPER_LANG="$1"
+      shift
+      ;;
+    -t)
+      TRANSLATE="true"
+      shift
+      ;;
+    -h|--help)
+      usage
+      exit 0
+      ;;
+    -*)
+      echo "Unknown option: $1"
+      usage
+      exit 1
+      ;;
+    *)
+      if [[ -n "$INPUT_FILE" ]]; then
+        echo "error: unexpected argument: $1"
+        usage
+        exit 1
+      fi
+      INPUT_FILE="$1"
+      shift
+      ;;
+  esac
+done
+
+if [[ -z "$INPUT_FILE" ]]; then
+  echo "error: no input file specified"
+  usage
+  exit 1
+fi
+
+INPUT_FILE="${INPUT_FILE/#\~/$HOME}"
+
+if [[ ! -f "$INPUT_FILE" ]]; then
+  echo "error: file not found: $INPUT_FILE"
+  exit 1
+fi
+
+# Derive output folder name from filename without extension
+BASENAME="$(basename "$INPUT_FILE")"
+STEM="${BASENAME%.*}"
+
+WORK_DIR="$(mktemp -d "/tmp/file-whisper-XXXXXX")"
+CHUNK_DIR="$WORK_DIR/chunks"
+OUTPUT_DIR="$HOME/whisper/outputs/${STEM}"
+mkdir -p "$CHUNK_DIR"
+mkdir -p "$OUTPUT_DIR"
+
+cleanup() {
+  rm -rf "$WORK_DIR"
+}
+trap cleanup EXIT
+
+echo "Input file  : $INPUT_FILE"
+echo "Output dir  : $OUTPUT_DIR"
+echo "Language    : $WHISPER_LANG"
+echo "Translate   : $TRANSLATE"
+echo
+
+srt_to_ms() {
+  local ts="$1"
+  local hh mm ss mmm
+  IFS=':,' read -r hh mm ss mmm <<< "$ts"
+  echo $((10#$hh * 3600000 + 10#$mm * 60000 + 10#$ss * 1000 + 10#$mmm))
+}
+
+ms_to_srt() {
+  local total_ms="$1"
+  local hh=$(( total_ms / 3600000 ))
+  local rem=$(( total_ms % 3600000 ))
+  local mm=$(( rem / 60000 ))
+  rem=$(( rem % 60000 ))
+  local ss=$(( rem / 1000 ))
+  local mmm=$(( rem % 1000 ))
+  printf "%02d:%02d:%02d,%03d" "$hh" "$mm" "$ss" "$mmm"
+}
+
+process_chunk() {
+  local file="$1"
+
+  local resp
+  resp="$(curl -sS -X POST "http://${REMOTE_HOST}:${REMOTE_PORT}/inference" \
+    -F "file=@${file}" \
+    -F "response_format=srt" \
+    -F "language=${WHISPER_LANG}" \
+    -F "translate=${TRANSLATE}" \
+    -F "beam_size=5" \
+    -F "best_of=5" \
+    -F "max_context=512" \
+    -F "temperature=0.0" \
+    -F "temperature_inc=0.0" \
+    -F "suppress_nst=true" \
+    -F "no_speech_thold=0.60" \
+    -F "entropy_thold=2.40" \
+    -F "logprob_thold=-1.00")"
+
+  local current_ts=""
+  local current_text=""
+  local max_local_end_ms=0
+
+  while IFS= read -r line; do
+    if [[ "$line" =~ ^[0-9]+$ ]]; then
+      continue
+    fi
+
+    if [[ "$line" =~ $_TS_SRT_PATTERN ]]; then
+      local start_local="${BASH_REMATCH[1]}"
+      local end_local="${BASH_REMATCH[2]}"
+      local start_local_ms end_local_ms
+      start_local_ms="$(srt_to_ms "$start_local")"
+      end_local_ms="$(srt_to_ms "$end_local")"
+
+      if (( end_local_ms > max_local_end_ms )); then
+        max_local_end_ms=$end_local_ms
+      fi
+
+      local start_abs_ms=$((GLOBAL_OFFSET_MS + start_local_ms))
+      local end_abs_ms=$((GLOBAL_OFFSET_MS + end_local_ms))
+      current_ts="$(ms_to_srt "$start_abs_ms") --> $(ms_to_srt "$end_abs_ms")"
+      continue
+    fi
+
+    if [[ -z "$line" ]]; then
+      if [[ -n "$current_ts" && -n "$current_text" ]]; then
+        local out_line="[${current_ts//,/.}]   ${current_text}"
+        printf '%s\n' "$out_line"
+        printf '%s\n' "$out_line" >> "${OUTPUT_DIR}/transcript_with_timestamps.txt"
+        printf '%s' "$current_text " >> "${OUTPUT_DIR}/transcript.txt"
+        current_ts=""
+        current_text=""
+      fi
+      continue
+    fi
+
+    if [[ -z "$current_text" ]]; then
+      current_text="$line"
+    else
+      current_text="$current_text $line"
+    fi
+  done <<< "$resp"
+
+  if [[ -n "$current_ts" && -n "$current_text" ]]; then
+    local out_line="[${current_ts//,/.}]   ${current_text}"
+    printf '%s\n' "$out_line"
+    printf '%s\n' "$out_line" >> "${OUTPUT_DIR}/transcript_with_timestamps.txt"
+    printf '%s' "$current_text " >> "${OUTPUT_DIR}/transcript.txt"
+  fi
+
+  if (( max_local_end_ms > 0 )); then
+    GLOBAL_OFFSET_MS=$((GLOBAL_OFFSET_MS + max_local_end_ms))
+  else
+    GLOBAL_OFFSET_MS=$((GLOBAL_OFFSET_MS + CHUNK_SECONDS * 1000))
+  fi
+}
+
+echo "Starting remote whisper-server on ${REMOTE_HOST}..."
+ssh "${REMOTE_USER}@${REMOTE_HOST}" "~/bin/start_whisper_server.sh ${REMOTE_PORT}"
+
+echo "Waiting for server to become reachable..."
+until curl -s "http://${REMOTE_HOST}:${REMOTE_PORT}/" >/dev/null 2>&1; do
+  sleep 1
+done
+
+echo "Converting and segmenting audio..."
+ffmpeg -loglevel error \
+  -i "$INPUT_FILE" \
+  -ac 1 -ar 16000 -c:a pcm_s16le \
+  -f segment -segment_time "${CHUNK_SECONDS}" -segment_format wav \
+  "${CHUNK_DIR}/chunk_%06d.wav"
+
+echo "Transcribing..."
+idx=0
+while true; do
+  chunk=$(printf "%s/chunk_%06d.wav" "$CHUNK_DIR" "$idx")
+  [[ -f "$chunk" ]] || break
+  process_chunk "$chunk"
+  idx=$((idx + 1))
+done
+
+echo
+echo "Done. Transcripts saved to:"
+echo "  ${OUTPUT_DIR}/transcript_with_timestamps.txt"
+echo "  ${OUTPUT_DIR}/transcript.txt"
